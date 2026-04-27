@@ -14,11 +14,9 @@ Modules
 - describe_missing      : Rapport synthétique sur les valeurs manquantes.
 - detect_outliers_iqr   : Détection des valeurs aberrantes via la méthode IQR.
 - cap_outliers_iqr      : Traitement des outliers par écrêtage (winsorisation).
-- impute_conductivity   : Imputation de Conductivity à partir de Solids (TDS proxy).
-- impute_solids         : Imputation de Solids à partir de Conductivity.
 - impute_ph_by_group    : Imputation de ph par médiane conditionnelle (groupe Potability).
-- impute_turbidity      : Imputation de Turbidity par médiane globale.
-- run_pipeline          : Orchestration complète du pipeline.
+- raw_data_processing   : Orchestration complète du pipeline de traitement brut.
+- preprocess_for_ml     : Split stratifié + RobustScaler (prétraitement ML).
 
 Dépendances
 -----------
@@ -124,19 +122,103 @@ def optimize_memory(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
 # 2. CHARGEMENT & SÉLECTION DES COLONNES
 # ===========================================================================
 
-def load_and_select(
-    filepath: str | Path,
-    optimize: bool = True,
-) -> pd.DataFrame:
+# Identifiant du dataset sur Kaggle
+KAGGLE_DATASET_SLUG: str = "adityakadiwal/water-potability"
+KAGGLE_CSV_FILENAME: str = "water_potability.csv"
+
+
+def _download_from_kaggle(dest_dir: Path) -> Path:
     """
-    Charge le CSV Kaggle et retourne uniquement les colonnes nécessaires.
+    Télécharge le dataset depuis Kaggle via l'API officielle.
+
+    Nécessite un fichier ``~/.kaggle/kaggle.json`` valide (username + key)
+    obtenu sur https://www.kaggle.com/settings → *Create New Token*.
 
     Parameters
     ----------
-    filepath : str | Path
-        Chemin vers le fichier ``water_potability.csv``.
+    dest_dir : Path
+        Répertoire de destination pour le fichier téléchargé.
+
+    Returns
+    -------
+    Path
+        Chemin complet vers le CSV extrait.
+
+    Raises
+    ------
+    ImportError
+        Si le package ``kaggle`` n'est pas installé.
+    OSError
+        Si l'authentification Kaggle échoue (kaggle.json absent ou invalide).
+    """
+    try:
+        import kaggle  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            "Le package 'kaggle' est requis pour le téléchargement automatique.\n"
+            "Installe-le avec :  pip install kaggle"
+        ) from exc
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = dest_dir / KAGGLE_CSV_FILENAME
+
+    if csv_path.exists():
+        logger.info("Dataset déjà présent localement : %s", csv_path)
+        return csv_path
+
+    logger.info("Téléchargement depuis Kaggle : %s → %s", KAGGLE_DATASET_SLUG, dest_dir)
+    try:
+        kaggle.api.authenticate()
+        kaggle.api.dataset_download_files(
+            KAGGLE_DATASET_SLUG,
+            path=str(dest_dir),
+            unzip=True,
+            quiet=False,
+        )
+    except Exception as exc:
+        raise OSError(
+            f"Échec du téléchargement Kaggle.\n"
+            f"Vérifie que ~/.kaggle/kaggle.json existe et est valide.\n"
+            f"Détail : {exc}"
+        ) from exc
+
+    if not csv_path.exists():
+        raise FileNotFoundError(
+            f"Le CSV '{KAGGLE_CSV_FILENAME}' est introuvable dans {dest_dir} "
+            "après extraction. Vérifie le contenu de l'archive."
+        )
+
+    logger.info("Dataset téléchargé avec succès : %s", csv_path)
+    return csv_path
+
+
+def load_and_select(
+    filepath: Optional[str | Path] = None,
+    optimize: bool = True,
+    kaggle_download_dir: str | Path = "./data",
+) -> pd.DataFrame:
+    """
+    Charge le CSV et retourne uniquement les colonnes nécessaires.
+
+    Deux modes de fonctionnement :
+
+    1. **Fichier local** — si ``filepath`` pointe vers un CSV existant,
+       celui-ci est chargé directement.
+    2. **Téléchargement automatique** — si ``filepath`` est ``None`` ou
+       inexistant, le dataset est téléchargé depuis Kaggle via l'API
+       officielle (nécessite ``~/.kaggle/kaggle.json``).
+
+    Parameters
+    ----------
+    filepath : str | Path | None, optional
+        Chemin vers ``water_potability.csv``. Si ``None``, déclenche le
+        téléchargement automatique depuis Kaggle.
     optimize : bool, optional
-        Si True, applique :func:`optimize_memory` après le chargement. Par défaut True.
+        Si True, applique :func:`optimize_memory` après le chargement.
+        Par défaut True.
+    kaggle_download_dir : str | Path, optional
+        Répertoire de destination utilisé uniquement lors du téléchargement
+        automatique. Par défaut ``"./data"``.
 
     Returns
     -------
@@ -146,17 +228,49 @@ def load_and_select(
     Raises
     ------
     FileNotFoundError
-        Si le fichier n'existe pas au chemin spécifié.
+        Si ``filepath`` est fourni mais introuvable, ou si le CSV n'est pas
+        présent après téléchargement.
     KeyError
         Si des colonnes attendues sont absentes du CSV.
-    """
-    filepath = Path(filepath)
-    if not filepath.exists():
-        raise FileNotFoundError(f"Fichier introuvable : {filepath}")
+    ImportError
+        Si ``kaggle`` n'est pas installé et qu'un téléchargement est requis.
+    OSError
+        Si l'authentification Kaggle échoue.
 
+    Examples
+    --------
+    >>> # Chargement depuis un fichier local
+    >>> df = load_and_select("data/water_potability.csv")
+
+    >>> # Téléchargement automatique si absent
+    >>> df = load_and_select()
+
+    >>> # Répertoire de téléchargement personnalisé
+    >>> df = load_and_select(kaggle_download_dir="./datasets/water")
+    """
+    # --- Résolution du chemin ---
+    if filepath is not None:
+        filepath = Path(filepath)
+        if not filepath.exists():
+            logger.warning(
+                "Fichier '%s' introuvable. Tentative de téléchargement depuis Kaggle…",
+                filepath,
+            )
+            filepath = _download_from_kaggle(Path(kaggle_download_dir))
+    else:
+        # Vérifier d'abord si le CSV est déjà dans le répertoire cible
+        local_candidate = Path(kaggle_download_dir) / KAGGLE_CSV_FILENAME
+        if local_candidate.exists():
+            logger.info("CSV trouvé dans le répertoire par défaut : %s", local_candidate)
+            filepath = local_candidate
+        else:
+            filepath = _download_from_kaggle(Path(kaggle_download_dir))
+
+    # --- Lecture ---
     df = pd.read_csv(filepath)
     logger.info("Dataset chargé : %d lignes × %d colonnes", *df.shape)
 
+    # --- Validation des colonnes ---
     missing_cols = set(ALL_COLS) - set(df.columns)
     if missing_cols:
         raise KeyError(f"Colonnes manquantes dans le CSV : {missing_cols}")
@@ -322,87 +436,8 @@ def cap_outliers_iqr(
 
 
 # ===========================================================================
-# 5. IMPUTATION PAR CORRÉLATION
+# 5. IMPUTATION PAR MÉDIANE CONDITIONNELLE
 # ===========================================================================
-
-def impute_conductivity(
-    df: pd.DataFrame,
-    factor: float = TDS_EC_FACTOR,
-) -> pd.DataFrame:
-    """
-    Impute les valeurs manquantes de ``Conductivity`` à partir de ``Solids``.
-
-    Relation physique utilisée (loi empirique TDS–EC) :
-        Conductivity (µS/cm) = Solids (mg/L) / factor
-
-    avec ``factor`` ≈ 0.64 (valeur OMS standard pour eau potable).
-
-    Cette imputation n'est appliquée qu'aux lignes où ``Conductivity`` est
-    manquante **et** ``Solids`` est disponible.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame contenant au moins les colonnes ``Conductivity`` et ``Solids``.
-    factor : float, optional
-        Facteur de conversion TDS → EC. Par défaut :data:`TDS_EC_FACTOR` = 0.64.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame avec ``Conductivity`` imputée (copie indépendante).
-
-    References
-    ----------
-    - WHO (2017). *Guidelines for Drinking-water Quality*, 4th ed., p. 218.
-    - APHA (2017). *Standard Methods for the Examination of Water and Wastewater*.
-    """
-    df = df.copy()
-    mask = df["Conductivity"].isna() & df["Solids"].notna()
-    n = mask.sum()
-    if n > 0:
-        df.loc[mask, "Conductivity"] = df.loc[mask, "Solids"] / factor
-        logger.info("Conductivity : %d valeurs imputées via Solids / %.2f", n, factor)
-    else:
-        logger.info("Conductivity : aucune imputation nécessaire via Solids.")
-    return df
-
-
-def impute_solids(
-    df: pd.DataFrame,
-    factor: float = TDS_EC_FACTOR,
-) -> pd.DataFrame:
-    """
-    Impute les valeurs manquantes de ``Solids`` (TDS) à partir de ``Conductivity``.
-
-    Relation physique utilisée :
-        Solids (mg/L) = factor × Conductivity (µS/cm)
-
-    Cette imputation n'est appliquée qu'aux lignes où ``Solids`` est manquant
-    **et** ``Conductivity`` est disponible.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame contenant au moins les colonnes ``Conductivity`` et ``Solids``.
-    factor : float, optional
-        Facteur de conversion EC → TDS. Par défaut :data:`TDS_EC_FACTOR` = 0.64.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame avec ``Solids`` imputée (copie indépendante).
-    """
-    df = df.copy()
-    mask = df["Solids"].isna() & df["Conductivity"].notna()
-    n = mask.sum()
-    if n > 0:
-        df.loc[mask, "Solids"] = df.loc[mask, "Conductivity"] * factor
-        logger.info("Solids : %d valeurs imputées via Conductivity × %.2f", n, factor)
-    else:
-        logger.info("Solids : aucune imputation nécessaire via Conductivity.")
-    return df
-
 
 def impute_ph_by_group(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -454,33 +489,6 @@ def impute_ph_by_group(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
-def impute_turbidity(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Impute les valeurs manquantes de ``Turbidity`` par médiane globale.
-
-    La turbidité n'a pas de corrélation physique forte et directe avec les
-    autres features retenues ; la médiane est robuste aux outliers résiduels.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame contenant la colonne ``Turbidity``.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame avec ``Turbidity`` imputée (copie indépendante).
-    """
-    df = df.copy()
-    n_missing = df["Turbidity"].isna().sum()
-    if n_missing > 0:
-        median_val = df["Turbidity"].median()
-        df["Turbidity"] = df["Turbidity"].fillna(median_val)
-        logger.info("Turbidity : %d valeurs imputées (médiane = %.4f)", n_missing, median_val)
-    else:
-        logger.info("Turbidity : aucune valeur manquante.")
-    return df
 
 
 # ===========================================================================
@@ -536,25 +544,22 @@ def validate_dataframe(df: pd.DataFrame) -> None:
 # 7. PIPELINE PRINCIPAL
 # ===========================================================================
 
-def run_pipeline(
+def raw_data_processing(
     filepath: str | Path,
     cap_factor: float = 1.5,
-    tds_ec_factor: float = TDS_EC_FACTOR,
     return_X_y: bool = False,
 ) -> pd.DataFrame | Tuple[pd.DataFrame, pd.Series]:
     """
-    Orchestre l'ensemble du pipeline de traitement des données.
+    Orchestre l'ensemble du pipeline de traitement des données brutes.
 
     Étapes :
     1. Chargement & sélection des colonnes (+ optimisation mémoire)
     2. Rapport sur les valeurs manquantes
     3. Détection des outliers (rapport uniquement)
     4. Écrêtage des outliers IQR + respect des bornes physiques
-    5. Imputation Conductivity ← Solids (relation TDS–EC)
-    6. Imputation Solids ← Conductivity (relation EC–TDS)
-    7. Imputation pH par médiane conditionnelle au groupe Potability
-    8. Imputation Turbidity par médiane globale
-    9. Validation finale du DataFrame
+    5. Imputation pH par médiane conditionnelle au groupe Potability
+    6. Relabélisation : 1 = Non potable, 0 = Potable
+    7. Validation finale du DataFrame
 
     Parameters
     ----------
@@ -562,8 +567,6 @@ def run_pipeline(
         Chemin vers ``water_potability.csv``.
     cap_factor : float, optional
         Facteur IQR pour l'écrêtage. Par défaut 1.5.
-    tds_ec_factor : float, optional
-        Facteur de conversion TDS ↔ EC. Par défaut :data:`TDS_EC_FACTOR`.
     return_X_y : bool, optional
         Si True, retourne le tuple ``(X, y)`` prêt pour scikit-learn.
         Si False (défaut), retourne le DataFrame complet.
@@ -575,8 +578,8 @@ def run_pipeline(
 
     Examples
     --------
-    >>> df = run_pipeline("water_potability.csv")
-    >>> X, y = run_pipeline("water_potability.csv", return_X_y=True)
+    >>> df = raw_data_processing("water_potability.csv")
+    >>> X, y = raw_data_processing("water_potability.csv", return_X_y=True)
     >>> from sklearn.ensemble import RandomForestClassifier
     >>> clf = RandomForestClassifier().fit(X, y)
     """
@@ -597,20 +600,22 @@ def run_pipeline(
     logger.info("--- Écrêtage des outliers (IQR factor=%.1f) ---", cap_factor)
     df = cap_outliers_iqr(df, factor=cap_factor, enforce_physical=True)
 
-    # Étape 5 & 6 : Imputation croisée Conductivity ↔ Solids
-    logger.info("--- Imputation croisée Conductivity ↔ Solids ---")
-    df = impute_conductivity(df, factor=tds_ec_factor)
-    df = impute_solids(df, factor=tds_ec_factor)
-
-    # Étape 7 : Imputation pH
+    # Étape 5 : Imputation pH
     logger.info("--- Imputation pH par groupe Potability ---")
     df = impute_ph_by_group(df)
 
-    # Étape 8 : Imputation Turbidity
-    logger.info("--- Imputation Turbidity ---")
-    df = impute_turbidity(df)
+    # Étape 6 : Relabélisation de la cible
+    # Convention retenue : 1 = Non potable (cas dangereux, classe majoritaire)
+    #                      0 = Potable
+    # Raison : les métriques sklearn (F1, recall, précision) ciblent la classe 1
+    # par défaut. En faisant de "Non potable" la classe 1, le modèle est évalué
+    # naturellement sur sa capacité à détecter l'eau dangereuse.
+    logger.info("--- Relabélisation : 1 = Non potable, 0 = Potable ---")
+    df[TARGET] = 1 - df[TARGET]
+    dist = df[TARGET].value_counts().to_dict()
+    logger.info("  Distribution après relabélisation : %s", dist)
 
-    # Étape 9 : Validation
+    # Étape 7 : Validation
     logger.info("--- Validation ---")
     validate_dataframe(df)
 
@@ -627,16 +632,131 @@ def run_pipeline(
 
 
 # ===========================================================================
+# 8. PRÉTRAITEMENT ML — STANDARDISATION & SPLIT
+# ===========================================================================
+
+def preprocess_for_ml(
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float = 0.20,
+    random_state: int = 42,
+    scaler=None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, object]:
+    """
+    Prépare les données pour l'entraînement ML : split stratifié + standardisation.
+
+    Méthode de standardisation : **RobustScaler**
+    ---------------------------------------------
+    Le RobustScaler centre les données sur la **médiane** et les met à l'échelle
+    selon l'**IQR** (intervalle interquartile Q1-Q3), ce qui le rend insensible
+    aux valeurs aberrantes résiduelles — une propriété critique pour ce dataset
+    dont les distributions de Conductivity et Solids sont fortement asymétriques.
+
+    Comparaison des scalers :
+    - ``StandardScaler`` : sensible aux outliers (utilise moyenne/ecart-type).
+    - ``MinMaxScaler``   : tres sensible aux extremes (compresse tout vers [0,1]).
+    - ``RobustScaler``   : robuste aux outliers, preserve la structure des donnees.
+
+    Procedure
+    ---------
+    1. Split stratifie train/test (preserve le ratio des classes dans chaque split).
+    2. Fit du scaler **uniquement sur le train set** (previent le data leakage).
+    3. Transform applique independamment sur train et test.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Features issues de :func:`run_pipeline`.
+    y : pd.Series
+        Cible binaire (0/1).
+    test_size : float, optional
+        Fraction reservee au test final. Par defaut 0.20 (80/20 split).
+    random_state : int, optional
+        Graine aleatoire pour la reproductibilite. Par defaut 42.
+    scaler : sklearn transformer, optional
+        Scaler custom a utiliser. Si ``None``, utilise ``RobustScaler()``.
+        Permet d'injecter un scaler deja fitte (inference en production).
+
+    Returns
+    -------
+    X_train : np.ndarray
+        Features d'entrainement standardisees.
+    X_test : np.ndarray
+        Features de test standardisees.
+    y_train : np.ndarray
+        Labels d'entrainement.
+    y_test : np.ndarray
+        Labels de test.
+    fitted_scaler : sklearn transformer
+        Scaler fitte sur le train set (a sauvegarder avec joblib pour
+        l'inference en production).
+
+    Examples
+    --------
+    >>> X, y = run_pipeline("water_potability.csv", return_X_y=True)
+    >>> X_train, X_test, y_train, y_test, scaler = preprocess_for_ml(X, y)
+    >>> import joblib
+    >>> joblib.dump(scaler, "outputs/models/scaler.joblib")
+    """
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import RobustScaler as _RobustScaler
+
+    # --- Split stratifie ---
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y,          # preserve le ratio potable/non-potable dans chaque split
+    )
+
+    logger.info(
+        "Split train/test : %d / %d  (stratifie, test_size=%.0f%%)",
+        len(X_train), len(X_test), test_size * 100,
+    )
+
+    # Distribution des classes apres split
+    for name, subset in [("Train", y_train), ("Test", y_test)]:
+        dist = subset.value_counts(normalize=True).round(3).to_dict()
+        logger.info("  %s -- distribution Potability : %s", name, dist)
+
+    # --- Standardisation RobustScaler ---
+    fitted_scaler = scaler if scaler is not None else _RobustScaler()
+
+    # IMPORTANT : fit uniquement sur le train pour eviter tout data leakage
+    X_train_scaled = fitted_scaler.fit_transform(X_train)
+    X_test_scaled  = fitted_scaler.transform(X_test)
+
+    logger.info(
+        "RobustScaler fitte sur le train set. "
+        "Centre (mediane) : %s | Echelle (IQR) : %s",
+        np.round(fitted_scaler.center_, 3),
+        np.round(fitted_scaler.scale_,  3),
+    )
+
+    return (
+        X_train_scaled,
+        X_test_scaled,
+        y_train.to_numpy(),
+        y_test.to_numpy(),
+        fitted_scaler,
+    )
+
+# ===========================================================================
 # Point d'entrée (usage direct)
 # ===========================================================================
 
 if __name__ == "__main__":
 
-    path ="data/water_potability.csv"
+    path ="data/raw/water_potability.csv"
 
-    X, y = run_pipeline(path, return_X_y=True)
+    X, y= raw_data_processing(path, return_X_y=True)
 
     print("\n--- Aperçu des features (5 premières lignes) ---")
     print(X.head().to_string())
     print(f"\nShape X : {X.shape}  |  Shape y : {y.shape}")
     print(f"Classes y : {dict(y.value_counts().sort_index())}")
+
+    X_train, X_test, y_train, y_test, scaler = preprocess_for_ml(X, y)
+    print(f"\n--- Prétraitement ML ---")
+    print(f"X_train : {X_train.shape} | X_test : {X_test.shape}")
+    print(f"Scaler  : {scaler}")
